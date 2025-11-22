@@ -1,0 +1,26 @@
+- name: Test
+  hosts: all
+  tasks:
+    # - name: Run custom Windows module
+    #   belair10.ad.acl:
+    #     to: CN=jonas.w,CN=Users,DC=fv,DC=mil,DC=se
+    #     for: tomb
+    #     right: User-Force-Change-Password 
+    #   register: aaa
+    #   ignore_errors: true
+
+    - name: run pr
+      belair10.ad.acl_pr:
+        object: CN=jonas.w,CN=Users,DC=fv,DC=mil,DC=se
+        principal: tomb@mil.se
+        object_type: User-Force-Change-Password
+        rights: ExtendedRight
+        type: allow
+      register: bbb
+      ignore_errors: true
+
+    # - debug:
+    #     msg: "{{aaa}}"
+    
+    - debug:
+        msg: "{{bbb}}"
