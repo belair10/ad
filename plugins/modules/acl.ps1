@@ -1,177 +1,144 @@
 #!powershell
 
-#AnsibleRequires -CSharpUtil Ansible.Basic
+# Copyright: (c) 2023, Ansible Project
+# GNU General Public License v3.0+ (see COPYING or https://www.gnu.org/licenses/gpl-3.0.txt)
 
-$ErrorActionPreference = "Stop"
+#AnsibleRequires -CSharpUtil Ansible.Basic
+#Requires -Module Ansible.ModuleUtils.Legacy
+#Requires -Module Ansible.ModuleUtils.SID
 
 $spec = @{
     options = @{
-        to = @{ type = "str"; required = $true }
-        for = @{ type = "str"; required = $true }
-        right = @{ type = "str"; required = $true }
-        inheritance = @{ type = "str"; default="None"; choices = "None", "All", "Descendents", "SelfOnly" }
+        object = @{ type = "str"; required = $true; aliases = "path" }
+        principal = @{ type = "str"; required = $true; aliases = "user" }
+        rights = @{ type = "str"; required = $true }
+        object_type = @{ type = "str"; aliases = "rights_attr" }
+        type = @{ type = "str"; required = $true; choices = "allow", "deny" }
+        inherit = @{ type = "str"; default = "None" }
+        inherited_object_type = @{ type = "str" }
+        state = @{ type = "str"; default = "present"; choices = "absent", "present" }
     }
-    supports_check_mode = $false
 }
 
 $module = [Ansible.Basic.AnsibleModule]::Create($args, $spec)
+$module.Result.changed = $false
 
-$to = $module.Params.to
-$for = $module.Params.for
-$right = $module.Params.right
-$inheritance = $module.Params.inheritance
-
-function Resolve-DistinguishedName {
-  param([string]$Name)
-
-  # 1) Already a DN
-  if ($Name -match "^CN=.*?,DC=.*") {
-      return $Name
-  }
-
-  # 2) DNS domain name → Domain DN
-  #    e.g. contoso.com → DC=contoso,DC=com
-  if ($Name -match "^[a-zA-Z0-9-]+\.[a-zA-Z0-9.-]+$") {
-      try {
-          $domain = Get-ADDomain -Identity $Name -ErrorAction Stop
-          return $domain.DistinguishedName
-      } catch {
-          # Try resolving manually
-          $parts = $Name.Split(".")
-          if ($parts.Count -ge 2) {
-              return ($parts | ForEach-Object { "DC=$_" }) -join ","
-          }
-          throw "Could not resolve domain name '$Name' to a DN."
-      }
-  }
-
-  # 3) NETBIOS domain name (CONTOSO)
-  try {
-      $domain = Get-ADDomain -Identity $Name -ErrorAction Stop
-      return $domain.DistinguishedName
-  } catch { }
-
-  # 4) Try resolving ANY AD object (user, group, OU, etc.)
-  $obj = Get-ADObject -Filter {
-      (samAccountName -eq $Name) -or
-      (name -eq $Name) -or
-      (displayName -eq $Name) -or
-      (mail -eq $Name)
-  } -Properties distinguishedName -ErrorAction SilentlyContinue
-
-  if ($obj) {
-      return $obj.DistinguishedName
-  }
-
-  throw "Could not resolve '$Name' to a distinguishedName."
+Try {
+    Import-Module ActiveDirectory
+}
+Catch {
+    $module.FailJson("Error importing module ActiveDirectory")
 }
 
-# Convert friendly name → DN
-$toDN = Resolve-DistinguishedName -Name $to
+$object = $module.Params.object
+$principal = $module.Params.principal
+$state = $module.Params.state
+$type = $module.Params.type
+$rights = $module.Params.rights
+$object_type = $module.Params.object_type
+$inherit = $module.Params.inherit
+$inherited_object_type = $module.Params.inherited_object_type
 
-# Mapping friendly extended rights → GUIDs
-$extendedRightsMap = @{
-    "DS-Replication-Get-Changes"                = "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2"
-    "DS-Replication-Get-Changes-All"            = "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2"
-    "DS-Replication-Get-Changes-In-Filtered-Set"= "89e95b76-444d-4c62-991a-0facbeda640c"
-    "Reanimate-Tombstones"                      = "4ecc03fe-ffc0-4947-b630-eb672a8a9d1a"
-    "User-Force-Change-Password"                = "00299570-246d-11d0-a768-00aa006e0529"
-}
+$user_sid = Convert-ToSID -account_name $principal
 
-# Convert inheritance string → enum
-switch ($inheritance) {
-    "None"        { $inheritEnum = [System.DirectoryServices.ActiveDirectorySecurityInheritance]::None }
-    "All"         { $inheritEnum = [System.DirectoryServices.ActiveDirectorySecurityInheritance]::All }
-    "Descendents" { $inheritEnum = [System.DirectoryServices.ActiveDirectorySecurityInheritance]::Descendents }
-    "SelfOnly"    { $inheritEnum = [System.DirectoryServices.ActiveDirectorySecurityInheritance]::SelfAndChildren }
-    default       { throw "Invalid inheritance value: $inheritance" }
-}
+$guidmap = @{}
+Get-ADObject -SearchBase ((Get-ADRootDSE).SchemaNamingContext) -LDAPFilter "(schemaidguid=*)" -Properties lDAPDisplayName, schemaIDGUID |
+    ForEach-Object { $guidmap[$_.lDAPDisplayName] = [System.GUID]$_.schemaIDGUID }
 
-# Determine if "Right" is:
-#   - native AD right enum (e.g. GenericWrite)
-#   - extended right friendly name (e.g. DS-Replication-Get-Changes)
-#   - direct GUID provided by user
-$objectTypeGUID = $null
-
-# 1) Friendly extended right
-if ($extendedRightsMap.ContainsKey($right)) {
-    $objectTypeGUID = New-Object Guid $extendedRightsMap[$right]
-    $adRights = [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight
-}
-# 2) Direct GUID input
-elseif ($right -match "^[0-9a-fA-F-]{36}$") {
-    $objectTypeGUID = New-Object Guid $right
-    $adRights = [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight
-}
-# 3) Native AD right
-else {
-    try {
-        $adRights = [System.DirectoryServices.ActiveDirectoryRights]::$right
-        $objectTypeGUID = [Guid]::Empty
+if ($rights_attr) {
+    if ($guidmap.Contains($object_type)) {
+        $objGUID = $guidmap[$object_type]
     }
-    catch {
-        throw "Unknown right: $right. Must be AD right name or extended-right GUID."
+    Else {
+        $module.FailJson("LDAP attribute $rights_attr does not exist")
     }
 }
-
-# Load target AD object
-$entry = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$toDN")
-$acl = $entry.ObjectSecurity
-
-# Build ACE
-if ($adRights -eq [System.DirectoryServices.ActiveDirectoryRights]::ExtendedRight) {
-    # Extended Right → Must supply objectType GUID and inheritance
-    $rule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
-        (New-Object System.Security.Principal.NTAccount($For)),
-        $adRights,
-        [System.Security.AccessControl.AccessControlType]::Allow,
-        $ObjectTypeGUID,
-        $inheritEnum
-    )
-}
-else {
-    # Standard right → Uses constructor without objectType GUID
-    $rule = New-Object System.DirectoryServices.ActiveDirectoryAccessRule(
-        (New-Object System.Security.Principal.NTAccount($For)),
-        $adRights,
-        [System.Security.AccessControl.AccessControlType]::Allow,
-        $inheritEnum
-    )
+Else {
+    $objGUID = [guid]::empty
 }
 
-# Apply ACE
-$acl.AddAccessRule($rule)
-$entry.ObjectSecurity = $acl
-$entry.CommitChanges()
-
-# Output JSON for Ansible
-$result = @{
-    changed = $true
-    granted_to = $for
-    target = $to
-    right = $right
-    inheritance = $inheritance
+if ($inherited_object_type) {
+    if ($guidmap.Contains($inherited_object_type)) {
+        $inheritGUID = $guidmap[$inherited_object_type]
+    }
+    Else {
+        $module.FailJson("LDAP attribute $inherited_object_type does not exist")
+    }
+}
+Else {
+    $inheritGUID = [guid]::empty
 }
 
-try {
-    $module.Result.values = @{}
+Try {
+    $objRights = [System.DirectoryServices.ActiveDirectoryRights]$rights
+    $InheritanceFlag = [System.DirectoryServices.ActiveDirectorySecurityInheritance]$inherit
 
-    $module.Result.values = $result
-    
-    $module.ExitJson()
-} catch {
-    $module.FailJson($_.Exception.Message)
+    If ($type -eq "allow") {
+        $objType = [System.Security.AccessControl.AccessControlType]::Allow
+    }
+    Else {
+        $objType = [System.Security.AccessControl.AccessControlType]::Deny
+    }
+
+    $objUser = New-Object System.Security.Principal.SecurityIdentifier($user_sid)
+    $objACE = New-Object System.DirectoryServices.ActiveDirectoryAccessRule($objUser, $objRights, $objType, $objGUID, $InheritanceFlag, $inheritGUID)
+    $objACL = Get-ACL -Path "AD:\$($object)"
+
+    $match = $false
+    ForEach ($rule in $objACL.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+        If (
+            ($rule.ActiveDirectoryRights -eq $objACE.ActiveDirectoryRights) -And
+            ($rule.InheritanceType -eq $objACE.InheritanceType) -And
+            ($rule.ObjectType -eq $objACE.ObjectType) -And
+            ($rule.InheritedObjectType -eq $objACE.InheritedObjectType) -And
+            ($rule.ObjectFlags -eq $objACE.ObjectFlags) -And
+            ($rule.AccessControlType -eq $objACE.AccessControlType) -And
+            ($rule.IdentityReference -eq $objACE.IdentityReference) -And
+            ($rule.IsInherited -eq $objACE.IsInherited) -And
+            ($rule.InheritanceFlags -eq $objACE.InheritanceFlags) -And
+            ($rule.PropagationFlags -eq $objACE.PropagationFlags)
+        ) {
+            $match = $true
+            Break
+        }
+    }
+
+    If ($state -eq "present" -And $match -eq $false) {
+        Try {
+            $objACL.AddAccessRule($objACE)
+            Set-ACL -Path "AD:\$($object)" -AclObject $objACL
+            $module.Result.changed = $true
+        }
+        Catch {
+            $module.FailJson("an exception occurred when adding the specified rule - $($_.Exception.Message)")
+        }
+    }
+    ElseIf ($state -eq "absent" -And $match -eq $true) {
+        Try {
+            $objACL.RemoveAccessRule($objACE)
+            Set-ACL -Path "AD:\$($object)" -AclObject $objACL
+            $module.Result.changed = $true
+        }
+        Catch {
+            $module.FailJson("an exception occurred when removing the specified rule - $($_.Exception.Message)")
+        }
+    }
+    Else {
+        # A rule was attempting to be added but already exists
+        If ($match -eq $true) {
+            $module.Result.msg = "the specified rule already exists"
+            $module.ExitJson()
+        }
+        # A rule didn't exist that was trying to be removed
+        Else {
+            $module.Result.msg = "the specified rule does not exist"
+            $module.ExitJson()
+        }
+    }
+
 }
-<#!
----
-module: win_myfeature
-short_description: My Windows feature module
-description:
-  - Demonstrates a custom Windows PowerShell module.
-options:
-  name:
-    description: Name of resource
-    required: false
-author:
-  - Your Name
-#>
+Catch {
+    $module.FailJson("an error occurred when attempting to $type $rights permission(s) on $object for $principal - $($_.Exception.Message)")
+}
+
+$module.ExitJson()
